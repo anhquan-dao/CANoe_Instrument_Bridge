@@ -104,14 +104,25 @@ def create_application_model(
             self._driver = None
             self._session_connected = False
             self._desired_state = {}
+            self._pending_desired_state = {}
             self._timer_running = False
             self._suppress_setpoint_events = False
             self._suppress_output_events = False
+            self._output_enable_debounce_pending = False
+            self._output_requests_outstanding = 0
+            self._confirmed_output_state = OUTPUT_UNKNOWN
+            self._pending_output_state = OUTPUT_UNKNOWN
             self._measurement_start = time.monotonic()
 
             self._panel_timer = vector.canoe.MsTimer(50, self._drain_updates)
             self._setpoint_timer = vector.canoe.MsTimer(
                 setpoint_debounce_ms, self._submit_desired_update
+            )
+            self._output_enable_timer = vector.canoe.MsTimer(
+                setpoint_debounce_ms, self._submit_output_update
+            )
+            self._output_state_timer = vector.canoe.MsTimer(
+                setpoint_debounce_ms, self._sync_output_enable_from_state
             )
             self._connection_values = {
                 value: _make_converted_value(
@@ -133,6 +144,7 @@ def create_application_model(
 
         def start(self):
             self._stop_event.clear()
+            self._pending_desired_state = self._snapshot_desired_state()
             system_variables.Connected = 0
             system_variables.ConnectionState = self._connection_values[
                 CONNECTION_DISCONNECTED
@@ -142,6 +154,11 @@ def create_application_model(
                 output_state_variable,
                 self._output_values[OUTPUT_UNKNOWN],
             )
+            self._confirmed_output_state = OUTPUT_UNKNOWN
+            self._pending_output_state = OUTPUT_UNKNOWN
+            self._output_enable_debounce_pending = False
+            self._output_requests_outstanding = 0
+            self._output_state_timer.cancel()
             system_variables.OperationStatus = (
                 "Ready; instrument output state not yet verified"
             )
@@ -166,6 +183,8 @@ def create_application_model(
             self._timer_running = False
             self._panel_timer.cancel()
             self._setpoint_timer.cancel()
+            self._output_enable_timer.cancel()
+            self._output_state_timer.cancel()
             self._drain_updates()
 
         def shutdown(self):
@@ -176,7 +195,13 @@ def create_application_model(
                 self._command("FindCommand", "find", read_mapping(driver_options))
             elif action == "connect_command":
                 resource = str(system_variables.ResourceName.copy()).strip()
-                self._command("ConnectCommand", "connect", resource, read_mapping(driver_options))
+                self._command(
+                    "ConnectCommand",
+                    "connect",
+                    resource,
+                    read_mapping(driver_options),
+                    dict(self._pending_desired_state),
+                )
                 self._queue_update("ConnectionState", CONNECTION_CONNECTING)
             elif action == "disconnect_command":
                 self._command("DisconnectCommand", "disconnect")
@@ -192,21 +217,22 @@ def create_application_model(
             elif action == "output_enable":
                 if self._suppress_output_events:
                     return
-                enabled = bool(int(_read_value(getattr(system_variables, output_enable_variable))))
-                self._requests.put(("output", enabled))
+                self._schedule_output_update()
 
             elif action == "apply_sequence":
                 sequence = int(_read_value(system_variables.ApplySequence))
                 if sequence == int(_read_value(system_variables.AppliedSequence)):
                     return
                 self._setpoint_timer.cancel()
+                desired = self._snapshot_desired_state()
+                self._pending_desired_state = desired
                 if int(_read_value(system_variables.Connected)) != 1:
-                    system_variables.OperationStatus = "Desired PSU state pending; connect PSU to apply"
+                    system_variables.OperationStatus = (
+                        "Desired configuration pending; connect instrument to apply"
+                    )
                     return
 
-                self._requests.put(
-                    ("apply",sequence,self._snapshot_desired_state())
-                )
+                self._requests.put(("apply", sequence, desired))
 
         def _command(self, variable_name, operation, *args):
             variable = getattr(system_variables, variable_name)
@@ -224,7 +250,10 @@ def create_application_model(
                 return
             
             if int(_read_value(system_variables.Connected)) != 1:
-                system_variables.OperationStatus = "Setpoint changed; connect before applying"
+                self._pending_desired_state = self._snapshot_desired_state()
+                system_variables.OperationStatus = (
+                    "Setpoint changed; configuration will apply after connection"
+                )
                 return
             
             self._setpoint_timer.cancel()
@@ -234,7 +263,69 @@ def create_application_model(
             if int(_read_value(system_variables.Connected)) != 1:
                 return
             
-            self._requests.put(("apply", self._snapshot_desired_state()))
+            desired = self._snapshot_desired_state()
+            self._pending_desired_state = desired
+            self._requests.put(("apply", desired))
+
+        def _schedule_output_update(self):
+            """Debounce button changes and submit only its latest requested value."""
+            self._output_enable_debounce_pending = True
+            self._output_enable_timer.cancel()
+            self._output_enable_timer.start()
+
+        def _submit_output_update(self):
+            if not self._output_enable_debounce_pending:
+                return
+            self._output_enable_debounce_pending = False
+            enabled = bool(
+                int(_read_value(getattr(system_variables, output_enable_variable)))
+            )
+            requested_state = OUTPUT_ON if enabled else OUTPUT_OFF
+
+            # Ignore a delayed CANoe on-change echo if the confirmed state is
+            # already the requested state. Do not skip while another request
+            # is outstanding, since a newer click may need to supersede it.
+            if (
+                self._output_requests_outstanding == 0
+                and requested_state == self._confirmed_output_state
+            ):
+                return
+
+            self._output_requests_outstanding += 1
+            try:
+                self._requests.put(("output", enabled), block=False)
+            except Exception:
+                self._output_requests_outstanding -= 1
+                raise
+
+        def _sync_output_enable_from_state(self):
+            """Mirror a settled, confirmed output state to the enable button."""
+            state = self._pending_output_state
+            if state not in (OUTPUT_OFF, OUTPUT_ON):
+                return
+            if self._output_enable_debounce_pending or self._output_requests_outstanding:
+                return
+            if not output_enable_variable:
+                return
+
+            current_state = int(
+                _read_value(getattr(system_variables, output_state_variable))
+            )
+            if current_state != state:
+                return
+
+            enable_variable = getattr(system_variables, output_enable_variable)
+            confirmed_enabled = state == OUTPUT_ON
+            if bool(int(_read_value(enable_variable))) != confirmed_enabled:
+                self._suppress_output_events = True
+                try:
+                    setattr(
+                        system_variables,
+                        output_enable_variable,
+                        int(confirmed_enabled),
+                    )
+                finally:
+                    self._suppress_output_events = False
 
         def _advance_apply_sequence(self, *args):
             sequence = int(_read_value(system_variables.ApplySequence))
@@ -261,6 +352,8 @@ def create_application_model(
                     system_variables.ConnectionState = self._connection_values[value]
                 elif name == output_state_variable:
                     state = int(value)
+                    self._confirmed_output_state = state
+                    self._pending_output_state = state
                     current = int(_read_value(getattr(system_variables, output_state_variable)))
                     if current != state:
                         self._suppress_output_events = True
@@ -273,23 +366,12 @@ def create_application_model(
                         finally:
                             self._suppress_output_events = False
 
-                    # This variable first carries the user's request; after a
-                    # known readback, reconcile it to the confirmed state.
-                    if output_enable_variable and state in (OUTPUT_OFF, OUTPUT_ON):
-                        enable_variable = getattr(
-                            system_variables, output_enable_variable
-                        )
-                        confirmed_enabled = state == OUTPUT_ON
-                        if bool(int(_read_value(enable_variable))) != confirmed_enabled:
-                            self._suppress_output_events = True
-                            try:
-                                setattr(
-                                    system_variables,
-                                    output_enable_variable,
-                                    int(confirmed_enabled),
-                                )
-                            finally:
-                                self._suppress_output_events = False
+                    self._output_state_timer.cancel()
+                    if state in (OUTPUT_OFF, OUTPUT_ON):
+                        if self._timer_running:
+                            self._output_state_timer.start()
+                        else:
+                            self._sync_output_enable_from_state()
                 elif name in setpoint_variables:
                     self._suppress_setpoint_events = True
                     try:
@@ -335,7 +417,11 @@ def create_application_model(
                 case "find":
                     self._find_instrument(request[1] if len(request) > 1 else None)
                 case "connect":
-                    self._connect(request[1], request[2] if len(request) > 2 else None)
+                    self._connect(
+                        request[1],
+                        request[2] if len(request) > 2 else None,
+                        request[3] if len(request) > 3 else {},
+                    )
                 case "disconnect":
                     self._close_session(disable_output=True)
                     self._set_disconnected("Disconnected; safe-off requested")
@@ -353,7 +439,12 @@ def create_application_model(
                         )
 
                 case "output":
-                    self._set_output(bool(request[1]))
+                    try:
+                        self._set_output(bool(request[1]))
+                    finally:
+                        self._output_requests_outstanding = max(
+                            0, self._output_requests_outstanding - 1
+                        )
 
             return False
 
@@ -372,7 +463,7 @@ def create_application_model(
                     "OperationStatus", f"Multiple matching resources; select one: {resources}"
                 )
 
-        def _connect(self, resource_name, options=None):
+        def _connect(self, resource_name, options=None, initial_desired=None):
             self._close_session(disable_output=True)
             if not resource_name:
                 raise ValueError("Device resource/name is empty")
@@ -382,9 +473,15 @@ def create_application_model(
                 identity = self._driver.connect(resource_name, options)
                 self._driver.configure_safe_defaults()
                 self._session_connected = True
+                desired = dict(initial_desired or {})
+                self._apply_configuration(desired)
+                self._desired_state = desired
                 self._queue_update("Connected", 1)
                 self._queue_update("ConnectionState", CONNECTION_CONNECTED)
-                self._queue_update("OperationStatus", f"Connected: {identity}; output remains OFF")
+                self._queue_update(
+                    "OperationStatus",
+                    f"Connected: {identity}; configuration applied; output remains OFF",
+                )
                 self._refresh_measurements()
             except Exception:
                 self._session_connected = False
@@ -393,6 +490,8 @@ def create_application_model(
                 except Exception:
                     pass
                 self._driver = None
+                self._queue_update("Connected", 0)
+                self._queue_update("ConnectionState", CONNECTION_FAULT)
                 raise
 
         def _apply_configuration(self, desired):

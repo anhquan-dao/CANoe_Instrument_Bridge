@@ -104,7 +104,6 @@ def create_application_model(
             self._driver = None
             self._session_connected = False
             self._desired_state = {}
-            self._pending_desired_state = {}
             self._timer_running = False
             self._suppress_setpoint_events = False
             self._suppress_output_events = False
@@ -144,7 +143,6 @@ def create_application_model(
 
         def start(self):
             self._stop_event.clear()
-            self._pending_desired_state = self._snapshot_desired_state()
             system_variables.Connected = 0
             system_variables.ConnectionState = self._connection_values[
                 CONNECTION_DISCONNECTED
@@ -195,12 +193,21 @@ def create_application_model(
                 self._command("FindCommand", "find", read_mapping(driver_options))
             elif action == "connect_command":
                 resource = str(system_variables.ResourceName.copy()).strip()
+                # Read the live CANoe values for every connection attempt. A
+                # startup snapshot can be stale if setpoints changed later.
+                initial_desired = self._snapshot_desired_state()
+                apply_sequence = int(_read_value(system_variables.ApplySequence))
+                applied_sequence = int(_read_value(system_variables.AppliedSequence))
+                pending_sequence = (
+                    apply_sequence if apply_sequence != applied_sequence else None
+                )
                 self._command(
                     "ConnectCommand",
                     "connect",
                     resource,
                     read_mapping(driver_options),
-                    dict(self._pending_desired_state),
+                    initial_desired,
+                    pending_sequence,
                 )
                 self._queue_update("ConnectionState", CONNECTION_CONNECTING)
             elif action == "disconnect_command":
@@ -225,7 +232,6 @@ def create_application_model(
                     return
                 self._setpoint_timer.cancel()
                 desired = self._snapshot_desired_state()
-                self._pending_desired_state = desired
                 if int(_read_value(system_variables.Connected)) != 1:
                     system_variables.OperationStatus = (
                         "Desired configuration pending; connect instrument to apply"
@@ -250,7 +256,6 @@ def create_application_model(
                 return
             
             if int(_read_value(system_variables.Connected)) != 1:
-                self._pending_desired_state = self._snapshot_desired_state()
                 system_variables.OperationStatus = (
                     "Setpoint changed; configuration will apply after connection"
                 )
@@ -264,7 +269,6 @@ def create_application_model(
                 return
             
             desired = self._snapshot_desired_state()
-            self._pending_desired_state = desired
             self._requests.put(("apply", desired))
 
         def _schedule_output_update(self):
@@ -421,13 +425,17 @@ def create_application_model(
                         request[1],
                         request[2] if len(request) > 2 else None,
                         request[3] if len(request) > 3 else {},
+                        request[4] if len(request) > 4 else None,
                     )
                 case "disconnect":
                     self._close_session(disable_output=True)
                     self._set_disconnected("Disconnected; safe-off requested")
                 case "apply":
-                    self._desired_state = dict(request[-1])
-                    self._apply_configuration(request[-1])
+                    desired = dict(request[-1])
+                    self._apply_configuration(desired)
+                    # Keep the last-known-good state if validation or hardware
+                    # application fails.
+                    self._desired_state = desired
                     self._refresh_measurements()
 
                     if len(request) >= 3:
@@ -463,7 +471,10 @@ def create_application_model(
                     "OperationStatus", f"Multiple matching resources; select one: {resources}"
                 )
 
-        def _connect(self, resource_name, options=None, initial_desired=None):
+        def _connect(
+            self, resource_name, options=None, initial_desired=None,
+            pending_sequence=None,
+        ):
             self._close_session(disable_output=True)
             if not resource_name:
                 raise ValueError("Device resource/name is empty")
@@ -476,6 +487,8 @@ def create_application_model(
                 desired = dict(initial_desired or {})
                 self._apply_configuration(desired)
                 self._desired_state = desired
+                if pending_sequence is not None:
+                    self._queue_update("AppliedSequence", pending_sequence)
                 self._queue_update("Connected", 1)
                 self._queue_update("ConnectionState", CONNECTION_CONNECTED)
                 self._queue_update(

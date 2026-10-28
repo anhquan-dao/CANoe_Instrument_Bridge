@@ -15,7 +15,7 @@ RigolDL3021ApplicationModel = create_application_model(
     model_name="RIGOL DL3021",
     panel=ELOAD_Panel,
     driver_factory=RigolDL3021TemplateDriverAdapter,
-    default_resource="USB0::0x1AB1::0x0E11::DL3A280900256::INSTR",
+    default_resource="USB0::0x1AB1::0x0E11::DL3A281000261::INSTR",
     desired_state={
         "mode": ("Mode", int),
         "setpoint": ("Setpoint", float),

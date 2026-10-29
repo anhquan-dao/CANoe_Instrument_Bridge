@@ -114,81 +114,6 @@ class RigolDL3021TemplateDriverAdapter(
         RigolOperatingMode.CURR: ("CURR", "A", "CC"),
     }
 
-    # DL3021 static-mode reference table. This documents the mode-specific
-    # setpoint, selectable ranges, and related settings for future adapter
-    # work; it does not imply that CV/CR/CP are currently implemented here.
-    # Range endpoints are from the RIGOL DL3000 User Guide. Use instrument
-    # MIN/MAX queries for runtime validation, since the usable operating point
-    # is also constrained by the DL3021's 150 V / 40 A / 200 W ratings.
-    MODE_SETTING_LOOKUP = {
-        "CC": {
-            "function": "CURR",
-            "setpoint": "Current",
-            "configuration_key": "setpoint",
-            "unit": "A",
-            "set_command": ":SOUR:CURR:LEV:IMM",
-            "query_command": ":SOUR:CURR:LEV:IMM?",
-            "range_command": ":SOUR:CURR:RANG",
-            "ranges": {
-                "low": (0.0, 4.0),
-                "high": (0.0, 40.0),
-            },
-            "additional_settings": (
-                "Slew",
-                "Von",
-                "V_Limit",
-                "C_Limit",
-            ),
-            "implemented": True,
-        },
-        "CV": {
-            "function": "VOLT",
-            "setpoint": "Voltage",
-            "configuration_key": "setpoint",
-            "unit": "V",
-            "set_command": ":SOUR:VOLT:LEV:IMM",
-            "query_command": ":SOUR:VOLT:LEV:IMM?",
-            "range_command": ":SOUR:VOLT:RANG",
-            "ranges": {
-                "low": (0.0, 15.0),
-                "high": (0.0, 150.0),
-            },
-            "additional_settings": ("V_Limit", "C_Limit"),
-            "implemented": False,
-        },
-        "CR": {
-            "function": "RES",
-            "setpoint": "Resistance",
-            "configuration_key": "setpoint",
-            "unit": "ohm",
-            "set_command": ":SOUR:RES:LEV:IMM",
-            "query_command": ":SOUR:RES:LEV:IMM?",
-            "range_command": ":SOUR:RES:RANG",
-            "ranges": {
-                "low": (0.08, 15.0),
-                "high": (2.0, 15000.0),
-            },
-            "additional_settings": ("Von", "V_Limit", "C_Limit"),
-            "notes": (
-                "Low resistance range may not work normally above 10 V input.",
-            ),
-            "implemented": False,
-        },
-        "CP": {
-            "function": "POW",
-            "setpoint": "Power",
-            "configuration_key": "setpoint",
-            "unit": "W",
-            "set_command": ":SOUR:POW:LEV:IMM",
-            "query_command": ":SOUR:POW:LEV:IMM?",
-            # CP has no selectable measurement range in the user guide.
-            "range_command": None,
-            "ranges": None,
-            "additional_settings": ("V_Limit", "C_Limit"),
-            "implemented": False,
-        },
-    }
-
     def __init__(self):
         self._resource_managers = {}
         self._instrument = None
@@ -325,64 +250,38 @@ class RigolDL3021TemplateDriverAdapter(
         self._logger.info("Safe defaults established; load input confirmed OFF in CC mode")
 
     def validate_configuration(self, configuration: Mapping[str, Any]) -> None:
-        """Validate a mode/setpoint against the mode lookup and live limits."""
-        requested_mode = configuration.get("mode")
+        '''
+        Validate user's configuration before sending out request
+        ONLY support most relevant mode: Static CC
+        TODO: Implement check for dynamic mode
+        '''
+        mode = -1
         try:
-            mode = RigolOperatingMode(requested_mode)
-            mode_name = self.MODE_COMMAND[mode][2]
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                f"Invalid RIGOL operating mode: {requested_mode!r}"
-            ) from error
-
-        mode_settings = self.MODE_SETTING_LOOKUP.get(mode_name)
-        if mode_settings is None:
-            raise ValueError(f"Invalid RIGOL operating mode: {requested_mode!r}")
-        if not mode_settings["implemented"]:
-            raise ValueError(
-                f"{mode_name} mode is documented but not implemented in this adapter"
-            )
-
-        self._require_instrument()
-        setpoint_key = mode_settings["configuration_key"]
-        # TODO: Apply mode-specific defaults when optional keywords are absent
-        # from the user's parameters; required setpoints must still be provided.
-        try:
-            setpoint = float(configuration[setpoint_key])
-        except KeyError as error:
-            raise ValueError(
-                f"Missing {mode_settings['setpoint']} parameter "
-                f"({setpoint_key!r}) for {mode_name} mode"
-            ) from error
+            mode = RigolOperatingMode(configuration.get("mode"))
         except (TypeError, ValueError) as error:
             raise ValueError(
-                f"{mode_settings['setpoint']} must be numeric in {mode_name} mode"
+                f"Invalid RIGOL operating mode: {configuration.get('mode')!r}"
             ) from error
+        
+        if mode != RigolOperatingMode.CURR:
+            raise ValueError("Only CC mode is enabled in this adapter")
 
-        if not math.isfinite(setpoint):
-            raise ValueError(f"{mode_settings['setpoint']} must be finite")
+        self._require_instrument()
+        match mode:
+            case RigolOperatingMode.CURR:
+                setpoint = float(configuration["setpoint"])
+                if not math.isfinite(setpoint) or setpoint < 0:
+                    raise ValueError("CC setpoint must be finite and non-negative")
 
-        documented_ranges = mode_settings["ranges"]
-        if documented_ranges and not any(
-            low <= setpoint <= high
-            for low, high in documented_ranges.values()
-        ):
-            range_text = " or ".join(
-                f"{low:g}..{high:g} {mode_settings['unit']}"
-                for low, high in documented_ranges.values()
-            )
-            raise ValueError(
-                f"{mode_settings['setpoint']} must be in {range_text}"
-            )
+                func, unit, label = self.MODE_COMMAND.get(RigolOperatingMode.CURR)
+                level_command = f":SOUR:{func}:LEV:IMM"
+                minimum = float(self._instrument.query(f"{level_command}? MIN"))
+                maximum = float(self._instrument.query(f"{level_command}? MAX"))
+                if not minimum <= setpoint <= maximum:
+                    raise ValueError(f"CC setpoint must be {minimum:g}..{maximum:g} {unit}")
 
-        level_command = mode_settings["set_command"]
-        minimum = float(self._instrument.query(f"{level_command}? MIN"))
-        maximum = float(self._instrument.query(f"{level_command}? MAX"))
-        if not minimum <= setpoint <= maximum:
-            raise ValueError(
-                f"{mode_settings['setpoint']} must be "
-                f"{minimum:g}..{maximum:g} {mode_settings['unit']}"
-            )
+            case _:
+                raise ValueError(f"{configuration.get('mode')!r} is not implemented in this adapter")
 
     def validate_desired_state(self, desired: Mapping[str, Any]) -> None:
         """Compatibility entry point for the current CANoe bridge."""

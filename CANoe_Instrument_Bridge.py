@@ -66,6 +66,7 @@ def create_application_model(
     output_state_variable="OutputState",
     poll_interval_seconds=0.5,
     setpoint_debounce_ms=200,
+    output_debounce_ms=600
 ):
     """Create a CANoe-decorated model bound to one panel and driver.
 
@@ -118,10 +119,10 @@ def create_application_model(
                 setpoint_debounce_ms, self._submit_desired_update
             )
             self._output_enable_timer = vector.canoe.MsTimer(
-                setpoint_debounce_ms, self._submit_output_update
+                output_debounce_ms, self._submit_output_update
             )
             self._output_state_timer = vector.canoe.MsTimer(
-                setpoint_debounce_ms, self._sync_output_enable_from_state
+                output_debounce_ms, self._sync_output_enable_from_state
             )
             self._connection_values = {
                 value: _make_converted_value(
@@ -404,7 +405,8 @@ def create_application_model(
                 except queue.Empty:
                     pass
                 except Exception as error:
-                    self._report_error(error, additional_text=" during handling request")
+                    self._report_error(type(error).__name__)
+                    self._report_error(error, additional_text=" during handling request " + str(request[0]))
 
                 if self._session_connected and time.monotonic() >= next_poll:
                     try:
@@ -442,8 +444,7 @@ def create_application_model(
                         self._queue_update("AppliedSequence", request[1])
                         self._queue_update(
                             "OperationStatus",
-                            f"Applied sequence {request[1]}: {request[-1]["voltage"]:g} V / {request[-1]["voltage"]:g} A; "
-                            f"output {'ON' if request[-1]["output_enabled"] else 'OFF'}",
+                            f"Applied sequence {request[1]}",
                         )
 
                 case "output":
@@ -579,7 +580,7 @@ def create_application_model(
             self._queue_update("OperationStatus", status)
 
         def _report_error(self, error, disconnect=False, additional_text=str()):
-            vector.canoe.write(f"[{model_name}] {error}")
+            vector.canoe.write(f"[{model_name}] {error}" + additional_text)
             self._queue_update("OperationStatus", str(error) + additional_text)
             if disconnect:
                 off_confirmed = self._close_session(disable_output=True)
